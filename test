@@ -1,0 +1,291 @@
+#!/usr/bin/env python
+from __future__ import print_function
+from lib2to3.pytree import Node
+import sys
+import math
+from tokenize import Double
+import numpy as np
+import time
+
+from  numpy import array, dot
+from quadprog import solve_qp
+#ROS Imports
+import rospy
+from sensor_msgs.msg import Image, LaserScan
+from ackermann_msgs.msg import AckermannDriveStamped, AckermannDrive
+from nav_msgs.msg import Odometry
+
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point
+
+class GapBarrier:
+    def __init__(self):
+        #list all initializations here, get everything needed from params file
+        # Read the algorithm parameter paramters form params.yaml
+        #ROS ones
+        lidarscan_topic = rospy.get_param('~scan_topic')
+        drive_topic = rospy.get_param('~nav_drive_topic')
+        odom_topic = rospy.get_param('~odom_topic')
+
+        self.t_prev = rospy.get_time()
+        #Params
+        self.kp = rospy.get_param('~kp')
+        self.kd = rospy.get_param('~kd')
+        self.delta_max = rospy.get_param('~delta_max')
+        self.angle_bl = math.radians(rospy.get_param('~angle_bl'))
+        self.angle_al = math.radians(rospy.get_param('~angle_al'))
+        self.angle_br = math.radians(rospy.get_param('~angle_br'))
+        self.angle_ar = math.radians(rospy.get_param('~angle_ar'))
+        self.v_des = rospy.get_param('~v_s_desired')
+        self.d_stop = rospy.get_param('~d_stop')
+        self.d_tau = rospy.get_param('~d_tau')
+        self.delta_theta = math.radians(rospy.get_param('~delta_theta'))
+        self.wheelbase = rospy.get_param('~wheelbase')
+        self.max_lidar_range = rospy.get_param('~scan_range')
+        self.scan_beams = rospy.get_param('~scan_beams')
+        self.left_beam_angle = rospy.get_param('~left_beam_angle')
+        self.right_beam_angle = rospy.get_param('~right_beam_angle')
+        self.safe_distance = rospy.get_param('~safe_distance')
+        self.n_pts_l = rospy.get_param('~n_pts_l')
+        self.n_pts_r = rospy.get_param('~n_pts_r')
+        self.tau = rospy.get_param('~tau')
+
+        # Add your subscribers for LiDAR scan and Odomotery here
+        rospy.Subscriber(lidarscan_topic, LaserScan, self.lidar_callback, queue_size=1)
+        rospy.Subscriber(odom_topic, Odometry, self.odom_callback, queue_size=1)
+        
+        # Add your publisher for Drive topic here
+        self.drive_pub = rospy.Publisher(drive_topic,AckermannDriveStamped, queue_size = 1)
+
+        # Initialize varables as needed 
+        self.vel = 0
+        self.ls_ang_inc = 2*math.pi/self.scan_beams
+        self.ls_str = int(round(self.scan_beams*self.right_beam_angle/(2*math.pi)))
+        self.ls_end = int(round(self.scan_beams*self.left_beam_angle/(2*math.pi)))
+        self.ls_len_mod = self.ls_end-self.ls_str+1
+        self.ls_fov = self.ls_len_mod*self.ls_ang_inc
+        self.angle_cen = self.ls_fov/2 
+        t = rospy.Time.from_sec(time.time())
+        self.current_time = t.to_sec()
+        self.prev_time = self.current_time
+        self.wl0 = np.array([0.0,-1.0])
+        self.wr0 = np.array([0.0,1.0])
+
+    # Optional function to pre-process LiDAR by considering only those LiDAR returns within a FOV in front of the vehicle;    
+    def preprocess_lidar(self, ranges):
+        data = []
+    
+        for i in range(self.ls_len_mod):
+            idx = self.ls_str + i
+            r = ranges[idx]
+            angle = i * self.ls_ang_inc - self.angle_cen
+
+            if r <= self.safe_distance:
+                data.append([0, angle])
+            elif r <= self.max_lidar_range:
+                data.append([r, angle]) #use LiDAR 
+            else:
+                data.append([self.max_lidar_range, angle]) #use max range if out of bounds
+
+        return np.array(data)
+    
+    # Optional function to find the the maximum gap in fron the vehicle 
+    def find_max_gap(self, proc_ranges):
+        j = 0
+        gap_start = 0
+        gap_end = 0
+        gap_start2 = 0
+        gap_end2 = 0
+        range_sum = 0
+        range_sum_new = 0
+        
+        for i in range (self.ls_len_mod):
+            if proc_ranges[i,0] !=0:
+                if j==0:
+                    gap_start = i
+                    range_sum_new = 0 
+                    j = 1
+                range_sum_new += proc_ranges[i,0]
+                gap_end = i 
+
+            if j == 1 and (proc_ranges[i,0] == 0 or i == self.ls_len_mod-1):
+                
+                j = 0
+                
+                if range_sum_new > range_sum:
+                    gap_end2 = gap_end
+                    gap_start2 = gap_start
+                    range_sum = range_sum_new 
+
+        return gap_start2, gap_end2
+
+    #Optional function to find the best direction of travel
+    # start_i & end_i are the start and end indices of max-gap range, respectively
+    # Returns index of best (furthest point) in ranges
+    def find_best_point(self, start_i, end_i, proc_ranges):
+
+        range_sum = 0
+        best_heading = 0
+
+        for i in range(start_i, end_i+1):
+            range_sum += proc_ranges[i,0]
+            best_heading += proc_ranges[i,0]*proc_ranges[i,1]
+
+        if range_sum != 0:
+            best_heading /= range_sum
+            return best_heading
+        
+        else: 
+            return 0.0
+
+    # Optional function to set up and solve the optimization problem for parallel virtual barriers 
+    def getWalls(self, left_obstacles, right_obstacles, wl0, wr0, alpha):
+     
+        P = np.array([[1.0,0,0],[0,1.0,0],[0,0,0.0001]])
+        
+        bl = np.full((self.n_pts_l),1.0,dtype=np.float64)
+        br = np.full((self.n_pts_r),1.0,dtype=np.float64)
+        b = np.concatenate((br,bl,np.array([-0.99,-0.99])))
+        #matrix 
+        Cl = -(left_obstacles.T)
+        Cr = -(right_obstacles.T)  
+        C1 = np.vstack((-Cr,br))
+        C2 = np.vstack((Cl,-bl))
+        C = np.hstack((C1,C2))
+        C = np.hstack((C,np.array([[0,0],[0,0],[1.0,-1.0]])))
+
+        a = np.zeros(3)
+
+        ws = solve_qp(P.astype(np.float), a.astype(np.float), C.astype(np.float), b.astype(np.float), 0)[0]
+
+        wr = np.array([ws[0]/(ws[2]-1),ws[1]/(ws[2]-1)])
+        wl = np.array([ws[0]/(ws[2]+1), ws[1]/(ws[2]+1)])
+
+        return wl,wr
+    
+    # This function is called whenever a new set of LiDAR data is received; bulk of your controller implementation should go here 
+    def lidar_callback(self, data):
+        
+        # Pre-process LiDAR data as necessary
+        ranges = data.ranges
+        proc_ranges = self.preprocess_lidar(ranges)
+
+        t = rospy.Time.from_sec(time.time())
+        self.current_time = t.to_sec()
+        dt = self.current_time - self.prev_time
+        self.prev_time = self.current_time
+
+        # Find the widest gap in front of vehicle
+        gap_start,gap_end=self.find_max_gap(proc_ranges)
+
+        # Find the Best Direction of Travel
+        heading_angle = self.find_best_point(gap_start, gap_end, proc_ranges)
+        
+        # Set up the QP for finding the two parallel barrier lines
+        index_l=int(round((self.angle_bl-self.angle_al)/(data.angle_increment*self.n_pts_l)))
+        index_r=int(round((self.angle_ar-self.angle_br)/(data.angle_increment*self.n_pts_r)))
+
+        mod_angle_al = (self.angle_al + heading_angle) % (2 * math.pi)
+        mod_angle_br = (self.angle_br + heading_angle) % (2 * math.pi)
+        
+        start_indx_l = int(round(mod_angle_al/data.angle_increment))
+        start_indx_r = int(round(mod_angle_br/data.angle_increment))
+
+        obstacle_points_l = np.zeros((self.n_pts_l,2))
+        obstacle_points_r = np.zeros((self.n_pts_r,2))
+
+        for k in range(0,self.n_pts_l):
+
+            obs_index = (start_indx_l+k*index_l) % self.scan_beams
+            obs_range = data.ranges[obs_index]
+            
+            if obs_range >= self.max_lidar_range:
+                obs_range = self.max_lidar_range
+            
+            obstacle_points_l[k][0] = - obs_range*math.cos(mod_angle_al+k*index_l*data.angle_increment)
+            obstacle_points_l[k][1] = - obs_range*math.sin(mod_angle_al+k*index_l*data.angle_increment)
+
+        for k in range(0,self.n_pts_r):
+            obs_index = (start_indx_r+k*index_r) % self.scan_beams
+            obs_range = data.ranges[obs_index]
+            if obs_range >= self.max_lidar_range:
+                obs_range = self.max_lidar_range
+
+            obstacle_points_r[k][0] = - obs_range*math.cos(mod_angle_br+k*index_r*data.angle_increment)
+            obstacle_points_r[k][1] = - obs_range*math.sin(mod_angle_br+k*index_r*data.angle_increment)
+
+        # Solve the QP problem to find the barrier lines parameters w,b
+        alpha = 1-math.exp(-dt/self.tau)
+        wl,wr = self.getWalls(obstacle_points_l, obstacle_points_r, self.wl0, self.wr0, alpha)
+        self.wl0 = wl
+        self.wr0 = wr
+        
+        # Compute the values of the variables needed for the implementation of feedback linearizing+PD controller
+        dl = 1/math.sqrt(np.dot(wl.T,wl))
+        dr = 1/math.sqrt(np.dot(wr.T,wr))
+
+        wl_h = wl*dl
+        wr_h = wr*dr
+        
+        # Compute the steering angle command
+
+        #Vehicle Moving? 
+        if self.vel >= 0.01 or self.vel <= -0.01: #Yes...
+
+            #Equation 7
+            d_tilda = dl-dr
+
+            #Equation 3
+            dlr_dot = self.vel*(wl_h[0]-wr_h[0])
+            
+            #Numerator of Equation 8 
+            num = (self.wheelbase*(self.kp*d_tilda+self.kd*dlr_dot))
+            
+            #Denominator of Equation 8
+            den = ((self.vel**2)*(-wl_h[1]+wr_h[1]))
+            
+            #Equation 8
+            delta = math.atan(num/den)
+
+        else: #No...
+            delta = 0 
+
+        #Equation 11
+        if delta > self.delta_max:
+            delta = self.delta_max
+
+        elif -self.delta_max <= delta <= self.delta_max:
+            delta = delta
+        
+        else: 
+           delta = -self.delta_max
+
+        sec_len = int(self.delta_theta/data.angle_increment)
+
+        # Find the closest obstacle point in a narrow field of view in front of the vehicle and compute the velocity command accordingly    
+        min_distance = min(data.ranges[-sec_len+int(self.scan_beams/2):sec_len+int(self.scan_beams/2)])
+
+        #Equation 20
+        velocity = self.v_des*(1-math.exp(-max(min_distance - self.d_stop,0)/self.d_tau))
+
+        # Publish the steering and speed commands to the drive topic
+        drive_msg = AckermannDriveStamped()
+        drive_msg.header.stamp = rospy.Time.now()
+        drive_msg.header.frame_id = "base_link"
+        drive_msg.drive.steering_angle = delta
+        drive_msg.drive.speed = velocity
+        self.drive_pub.publish(drive_msg)
+
+    # Odometry callback 
+    def odom_callback(self, odom_msg):
+        # update current speed
+        self.vel = odom_msg.twist.twist.linear.x
+
+def main(args):
+    rospy.init_node("GapWallFollow_node", anonymous=True)
+    wf = GapBarrier()
+    rospy.sleep(0.1)
+    rospy.spin()
+
+if __name__=='__main__':
+	main(sys.argv)
